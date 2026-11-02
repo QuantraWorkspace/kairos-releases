@@ -1,0 +1,78 @@
+name: Build and publish
+# MacroAnalysis pushes a src-<commit> tag here once its CI passes on main. This builds that commit on Windows,
+# installs and runs it, then publishes it as the next version. Installed apps update themselves from these releases.
+# SOURCE_DEPLOY_KEY is a read-only deploy key on the private MacroAnalysis repo.
+on:
+  push:
+    tags: ['src-*']
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: MacroAnalysis commit to build
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: publish
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Keep line endings exact
+        run: |
+          git config --global core.autocrlf false
+          echo "SOURCE_SHA=${SOURCE_SHA#src-}" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+        with:
+          repository: QuantraWorkspace/MacroAnalysis
+          ref: ${{ env.SOURCE_SHA }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '23'
+          cache: npm
+      - name: Install build tools
+        run: python -m pip install -r requirements.txt && npm ci
+      - name: Next version
+        run: |
+          latest=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || echo v1.0.0)
+          IFS=. read -r major minor patch <<< "${latest#v}"
+          echo "VERSION=$major.$minor.$((patch + 1))" >> "$GITHUB_ENV"
+      - name: Set version
+        run: npm version "$VERSION" --no-git-tag-version
+      - name: Build installer
+        run: bash scripts/package_windows.sh
+        env:
+          KAIROS_PYTHON: python
+      - name: Install and run on Windows
+        shell: pwsh
+        run: ./.github/windows_smoke.ps1
+      - name: Keep app logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kairos-windows-logs
+          retention-days: 7
+          if-no-files-found: ignore
+          path: ~/AppData/Roaming/Kairos Macro Terminal/.local/logs/
+      - name: Publish
+        run: |
+          gh release create "v$VERSION" dist/KairosMacroTerminal-Setup-*.exe dist/KairosMacroTerminal-Setup-*.exe.blockmap dist/latest.yml \
+            --repo "$GITHUB_REPOSITORY" --target main --title "Kairos Macro Terminal $VERSION" --notes "Automatic Windows build."
+      - name: Remove the trigger tag
+        if: always() && github.event_name == 'push'
+        run: gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$GITHUB_REF_NAME" || true
